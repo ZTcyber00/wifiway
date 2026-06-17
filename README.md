@@ -96,7 +96,7 @@ pip install -r requirements.txt
 ## 🚀 Kurulum & Çalıştırma
 
 ```bash
-git clone https://github.com/ZTcyber00/wifway.git
+git clone https://github.com/ZTcyber00/wifiway.git
 cd wifway
 pip install -r requirements.txt
 sudo python3 wifi_scanner.py
